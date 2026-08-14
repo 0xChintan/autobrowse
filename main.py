@@ -219,7 +219,13 @@ async def run_agent(run: Run, llm: LLMClient) -> None:
 
     try:
         run.emit("status", message=f"Launching Chromium · thinking with {llm.description}")
+        # Load the model while Chromium boots — the two have nothing to say to
+        # each other, and on a cold local model this is the bulk of the wait.
+        warming = asyncio.create_task(llm.warm())
         await browser.start()
+        warm_ok, warm_detail = await warming
+        if llm.provider == "ollama":
+            run.emit("status", message=("Model ready · " if warm_ok else "Warm-up failed · ") + warm_detail)
         if browser.start_error:
             # Not fatal: the agent still gets a turn and can navigate itself.
             run.emit("status", message=f"Start URL failed — {browser.start_error}")
@@ -446,6 +452,11 @@ class ConfirmRequest(BaseModel):
     approved: bool
 
 
+class WarmRequest(BaseModel):
+    provider: str | None = None
+    model: str | None = None
+
+
 @app.get("/")
 async def index() -> FileResponse:
     return FileResponse(BASE_DIR / "static" / "index.html")
@@ -463,6 +474,17 @@ async def models() -> dict[str, Any]:
     info = await discover_providers()
     info["max_steps"] = MAX_STEPS
     return info
+
+
+@app.post("/api/warm")
+async def warm(req: WarmRequest) -> dict[str, Any]:
+    """Preload a model so the first step of the next run isn't a cold start."""
+    try:
+        client = LLMClient(provider=req.provider, model=req.model)
+    except LLMError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    ok, detail = await client.warm()
+    return {"ok": ok, "detail": detail, "provider": client.provider, "model": client.model}
 
 
 @app.post("/api/run")

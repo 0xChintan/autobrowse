@@ -430,10 +430,38 @@ async function loadModels() {
     setPill("error", "no models");
     $("#counter").textContent = "set GROQ_API_KEY or run: ollama serve";
     $("#go").disabled = true;
+  } else {
+    warmSelected();   // start loading the restored pick straight away
   }
 }
 
-$("#model").onchange = (e) => localStorage.setItem(PICK_KEY, e.target.value);
+/* Preload a local model as soon as it's chosen. Loading an 8B model off disk
+   costs ~50s; doing it here means it overlaps with typing the task instead of
+   being charged to step 1. No-op for Groq. */
+let warming = false;
+async function warmSelected() {
+  const [provider, model] = ($("#model").value || "::").split("::");
+  if (provider !== "ollama" || !model || warming) return;
+  warming = true;
+  setPill("running", "loading " + model);
+  try {
+    const r = await (await fetch("/api/warm", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ provider, model }),
+    })).json();
+    setPill(r.ok ? "done" : "error", r.ok ? "model ready" : "warm-up failed");
+    $("#counter").textContent = r.detail || "";
+  } catch {
+    setPill("error", "warm-up failed");
+  } finally {
+    warming = false;
+  }
+}
+
+$("#model").onchange = (e) => {
+  localStorage.setItem(PICK_KEY, e.target.value);
+  warmSelected();
+};
 
 /* ------------------------------ recent runs ------------------------------- */
 

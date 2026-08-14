@@ -16,6 +16,7 @@ import asyncio
 import json
 import os
 import re
+import time
 from typing import Any
 
 import httpx
@@ -31,6 +32,11 @@ OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
 # observation plus generation, and unlike 8192 it still leaves room for an 8B
 # model's weights on a 5-6 GB VRAM budget. Raise it if you have the memory.
 OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "4096"))
+
+# How long Ollama keeps the model resident after a request. Loading an 8B model
+# off disk costs ~50s; inference once it is hot costs ~4s. Ollama's own default
+# is 5m, so idling between runs silently re-pays that 50s. Hold it much longer.
+OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "30m")
 
 # Shown if the live Groq catalog can't be fetched. Cheapest first is deliberate:
 # free-tier rate limits are per-model, so a smaller model is the escape hatch
@@ -146,6 +152,7 @@ class LLMClient:
             "model": self.model,
             "stream": False,
             "format": "json",
+            "keep_alive": OLLAMA_KEEP_ALIVE,
             "options": {
                 "temperature": temperature,
                 "num_predict": max_tokens,
@@ -169,6 +176,33 @@ class LLMClient:
         except Exception as exc:
             raise LLMError(f"Ollama request failed: {exc}") from exc
         return (data.get("message") or {}).get("content", "")
+
+    async def warm(self) -> tuple[bool, str]:
+        """Load the model into memory so the first real step isn't a cold start.
+
+        Costs nothing on Groq. On Ollama this is the difference between a 55s
+        first step and a 4s one — the load happens here instead of inside the
+        run. Safe to call repeatedly; a resident model returns immediately.
+        """
+        if self.provider != "ollama":
+            return True, "no warm-up needed"
+        started = time.perf_counter()
+        try:
+            async with httpx.AsyncClient(timeout=600.0) as client:
+                resp = await client.post(
+                    f"{OLLAMA_HOST}/api/chat",
+                    json={
+                        "model": self.model,
+                        "stream": False,
+                        "keep_alive": OLLAMA_KEEP_ALIVE,
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "options": {"num_predict": 1, "num_ctx": OLLAMA_NUM_CTX},
+                    },
+                )
+                resp.raise_for_status()
+        except Exception as exc:
+            return False, f"could not load '{self.model}': {exc}"
+        return True, f"{self.model} resident ({time.perf_counter() - started:.1f}s)"
 
     async def healthcheck(self) -> tuple[bool, str]:
         """Cheap reachability probe used by the frontend banner."""

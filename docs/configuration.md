@@ -12,6 +12,7 @@ file next to `main.py` (loaded automatically by `python-dotenv`).
 | `OLLAMA_MODEL` | `llama3` | preselected Ollama model |
 | `OLLAMA_HOST` | `http://localhost:11434` | Ollama endpoint |
 | `OLLAMA_NUM_CTX` | `4096` | Ollama context window — must exceed ~2,500 |
+| `OLLAMA_KEEP_ALIVE` | `30m` | how long Ollama holds the model in memory (`-1` = forever) |
 
 ## Agent
 

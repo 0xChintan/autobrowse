@@ -124,6 +124,7 @@ That's what stops the classic loop of clicking a stale id fifteen times.
 | `GET /api/events/{run_id}` | SSE stream (see below) |
 | `POST /api/confirm/{run_id}` | `{approved: bool}` — answer a safety prompt |
 | `POST /api/cancel/{run_id}` | abort a run |
+| `POST /api/warm` | `{provider?, model?}` — preload a model so step 1 isn't a cold start |
 | `GET /api/health` | which LLM provider is live |
 
 SSE event types: `status`, `thinking`, `step`, `confirm`, `done`, `error`,

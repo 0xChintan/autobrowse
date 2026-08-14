@@ -125,7 +125,41 @@ ollama pull qwen2.5:3b-instruct    # ~2 GB, the better of the two at strict JSON
 ollama pull llama3.2:3b            # ~2 GB
 ```
 
-**Measured here** — `llama3:latest` on an 8 GB M3, `num_ctx=4096`, against
-`html.duckduckgo.com`: task completed in 2 steps, ~114 s wall clock including
-loading the model into memory. It held the JSON schema and used the
-`\n`-to-submit convention correctly. Slower than Groq, but nothing to exhaust.
+### Speed
+
+Profiled on an 8 GB M3 with `llama3:latest`, `num_ctx=4096`:
+
+| Phase | Time |
+|---|---|
+| Chromium launch | 1.6 s |
+| Page load + settle | 2.1 s |
+| Serialize the DOM | **0.04 s** |
+| Inference — model **cold** | **56 s** |
+| Inference — model **hot** | **3.8 s** |
+
+The browser is not the bottleneck; loading the model off disk is. Everything
+below targets that one number.
+
+**1. AutoBrowse preloads the model for you.** Picking an Ollama model in the
+dropdown fires `POST /api/warm` immediately, so the load overlaps with you
+typing the task instead of being charged to step 1. A run also warms the model
+concurrently with the Chromium launch. You'll see `Model ready · llama3:latest
+resident (13.6s)` in the timeline.
+
+**2. It stays resident for 30 minutes.** Ollama's own default is 5 minutes, so
+a coffee break silently re-paid the load cost. Override with
+`OLLAMA_KEEP_ALIVE` (`-1` keeps it loaded until Ollama restarts).
+
+**3. Use a smaller model.** On 8 GB the 8B is both slow to load and close to
+the VRAM ceiling. A 3B loads in a fraction of the time and roughly halves
+per-step latency:
+
+```bash
+ollama pull qwen2.5:3b-instruct
+```
+
+With the model hot, a 4-step run is roughly `4 × 3.8 s` of thinking plus ~4 s
+of browser — around 20 s, against ~114 s for the same run cold.
+
+**4. If you want fast, use Groq.** Inference is sub-second there; the local
+path buys you privacy and no quota, not speed.
