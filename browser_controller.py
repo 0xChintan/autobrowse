@@ -22,12 +22,16 @@ from playwright.async_api import (
 )
 
 # Elements reported to the LLM per observation. Enough for a real page, small
-# enough to keep the prompt cheap.
-MAX_ELEMENTS = 120
+# enough to keep the prompt cheap — prompt size is the binding constraint both
+# for Groq's daily token cap and for fitting a local model's context window.
+MAX_ELEMENTS = int(os.getenv("AUTOBROWSE_MAX_ELEMENTS", "60"))
 # Visible page text handed to the LLM so it can actually read results.
-MAX_PAGE_TEXT = 2500
+MAX_PAGE_TEXT = int(os.getenv("AUTOBROWSE_MAX_PAGE_TEXT", "1400"))
 
 DEFAULT_TIMEOUT_MS = 12_000
+# Page loads get their own, longer budget: a first paint on a slow or busy
+# connection routinely takes longer than an element interaction ever should.
+NAV_TIMEOUT_MS = int(os.getenv("AUTOBROWSE_NAV_TIMEOUT", "45000"))
 
 
 # --------------------------------------------------------------------------- #
@@ -122,13 +126,9 @@ _SERIALIZE_JS = """
     return text;
   };
 
-  const results = [];
-  let id = 0;
-  const seen = new Set();
-
+  // Pass 1 — every element worth reporting, in document order.
+  const candidates = [];
   for (const el of document.querySelectorAll(SELECTOR)) {
-    if (results.length >= maxElements) break;
-    if (seen.has(el)) continue;
     if (!isVisible(el)) continue;
     if (looksLikeAd(el)) continue;
 
@@ -139,16 +139,9 @@ _SERIALIZE_JS = """
     // A control with no label and no distinguishing attributes is noise.
     if (!label && !['input', 'textarea', 'select'].includes(tag) && !role) continue;
 
-    seen.add(el);
-    id += 1;
-    el.setAttribute('data-autobrowse-id', String(id));
-
     const rect = el.getBoundingClientRect();
-    results.push({
-      id,
-      tag,
-      role,
-      label,
+    candidates.push({
+      el, tag, role, label,
       type: el.getAttribute('type') || '',
       placeholder: el.getAttribute('placeholder') || '',
       name: el.getAttribute('name') || '',
@@ -158,12 +151,35 @@ _SERIALIZE_JS = """
     });
   }
 
+  // Pass 2 — if we have to drop some, drop off-screen ones first. Plain
+  // document order would spend the budget on header/nav chrome and truncate
+  // before reaching the content the agent is actually looking at.
+  const truncated = candidates.length > maxElements;
+  let chosen = candidates;
+  if (truncated) {
+    const order = new Map(candidates.map((c, i) => [c, i]));
+    chosen = candidates.filter(c => c.inViewport)
+      .concat(candidates.filter(c => !c.inViewport))
+      .slice(0, maxElements)
+      .sort((a, b) => order.get(a) - order.get(b));  // ids still read top-to-bottom
+  }
+
+  const results = chosen.map((c, i) => {
+    const id = i + 1;
+    c.el.setAttribute('data-autobrowse-id', String(id));
+    return {
+      id, tag: c.tag, role: c.role, label: c.label, type: c.type,
+      placeholder: c.placeholder, name: c.name, value: c.value,
+      href: c.href, inViewport: c.inViewport,
+    };
+  });
+
   const text = (document.body ? document.body.innerText : '') || '';
   return {
     url: location.href,
     title: document.title || '',
     elements: results,
-    truncated: id >= maxElements,
+    truncated,
     text: text.replace(/\\n{3,}/g, '\\n\\n').trim(),
     scrollY: Math.round(window.scrollY),
     scrollHeight: Math.round(document.body ? document.body.scrollHeight : 0),
@@ -253,6 +269,9 @@ class BrowserController:
         self._browser: Browser | None = None
         self._context: BrowserContext | None = None
         self.page: Page | None = None
+        # Set when the start URL wouldn't load. Not fatal — the agent can issue
+        # its own `navigate` action and recover.
+        self.start_error: str | None = None
 
     # -- lifecycle ---------------------------------------------------------- #
 
@@ -274,7 +293,10 @@ class BrowserController:
         self._context.on("page", self._on_new_page)
         self.page = await self._context.new_page()
         if self.start_url and self.start_url != "about:blank":
-            await self.goto(self.start_url)
+            try:
+                await self.goto(self.start_url)
+            except ActionError as exc:
+                self.start_error = str(exc)
 
     def _on_new_page(self, page: Page) -> None:
         self.page = page
@@ -299,12 +321,23 @@ class BrowserController:
         assert self.page is not None
         if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", url):
             url = "https://" + url
-        try:
-            await self.page.goto(url, wait_until="domcontentloaded", timeout=25_000)
-        except Exception as exc:
-            raise ActionError(f"could not load {url}: {_short(exc)}") from exc
-        await self._settle()
-        return f"loaded {self.page.url}"
+
+        # "commit" resolves as soon as the response starts arriving, so a page
+        # that is merely slow still gives us something to serialize instead of
+        # failing the step outright.
+        last: Exception | None = None
+        for wait_until in ("domcontentloaded", "commit"):
+            try:
+                await self.page.goto(url, wait_until=wait_until, timeout=NAV_TIMEOUT_MS)
+                await self._settle()
+                return f"loaded {self.page.url}"
+            except Exception as exc:
+                last = exc
+
+        raise ActionError(
+            f"could not load {url} after {NAV_TIMEOUT_MS // 1000}s: {_short(last)} "
+            "— the connection may be saturated, or the site may be blocking automation"
+        ) from last
 
     async def observe(self) -> Observation:
         assert self.page is not None

@@ -1,0 +1,25 @@
+# Secrets — the docs suggest putting GROQ_API_KEY here. Never commit it.
+.env
+.env.*
+!.env.example
+
+# Virtualenv
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Playwright / test output
+test-results/
+playwright-report/
+*.png
+!docs/**/*.png
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

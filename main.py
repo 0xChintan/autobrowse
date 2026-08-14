@@ -20,7 +20,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from browser_controller import ActionError, BrowserController, Observation
-from llm_client import LLMClient, LLMError
+from llm_client import LLMClient, LLMError, discover_providers
 
 try:  # optional convenience; not required
     from dotenv import load_dotenv
@@ -32,7 +32,7 @@ except ImportError:
 BASE_DIR = Path(__file__).parent
 MAX_STEPS = int(os.getenv("AUTOBROWSE_MAX_STEPS", "15"))
 CONFIRM_TIMEOUT_S = float(os.getenv("AUTOBROWSE_CONFIRM_TIMEOUT", "180"))
-HISTORY_IN_PROMPT = 8
+HISTORY_IN_PROMPT = int(os.getenv("AUTOBROWSE_HISTORY", "5"))
 
 VALID_ACTIONS = {"click", "type", "scroll", "navigate", "wait", "done"}
 
@@ -220,12 +220,23 @@ async def run_agent(run: Run, llm: LLMClient) -> None:
     try:
         run.emit("status", message=f"Launching Chromium · thinking with {llm.description}")
         await browser.start()
-        run.emit("status", message=f"Opened {run.url}")
+        if browser.start_error:
+            # Not fatal: the agent still gets a turn and can navigate itself.
+            run.emit("status", message=f"Start URL failed — {browser.start_error}")
+        else:
+            run.emit("status", message=f"Opened {run.url}")
 
         for step_no in range(1, MAX_STEPS + 1):
             obs = await browser.observe()
 
             warnings: list[str] = []
+            # A failed load leaves Chromium on an opaque error page. Say so
+            # plainly, or the model tries to interact with an empty document.
+            if obs.url.startswith("chrome-error://") or (step_no == 1 and browser.start_error):
+                warnings.append(
+                    "The current page FAILED TO LOAD. There is nothing here to click. "
+                    "Use the 'navigate' action to open a working URL before anything else."
+                )
             for sig in sorted(blocked):
                 warnings.append(
                     f"'{sig}' has already failed twice and is now blocked. "
@@ -427,6 +438,8 @@ if (BASE_DIR / "static").is_dir():
 class RunRequest(BaseModel):
     task: str = Field(min_length=1)
     url: str = "https://duckduckgo.com"
+    provider: str | None = None  # "groq" | "ollama"; None -> auto-detect
+    model: str | None = None
 
 
 class ConfirmRequest(BaseModel):
@@ -444,12 +457,34 @@ async def health() -> dict[str, Any]:
     return {"ok": ok, "provider": llm_client.provider, "message": message, "max_steps": MAX_STEPS}
 
 
+@app.get("/api/models")
+async def models() -> dict[str, Any]:
+    """Everything the UI needs to render its provider/model picker."""
+    info = await discover_providers()
+    info["max_steps"] = MAX_STEPS
+    return info
+
+
 @app.post("/api/run")
 async def start_run(req: RunRequest) -> dict[str, str]:
-    run = Run(id=uuid.uuid4().hex, task=req.task.strip(), url=req.url.strip() or "https://duckduckgo.com")
+    # A run gets its own client so the picked model applies to that run only.
+    try:
+        client = (
+            LLMClient(provider=req.provider, model=req.model)
+            if (req.provider or req.model)
+            else llm_client
+        )
+    except LLMError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    run = Run(
+        id=uuid.uuid4().hex,
+        task=req.task.strip(),
+        url=req.url.strip() or "https://duckduckgo.com",
+    )
     RUNS[run.id] = run
-    run.task_handle = asyncio.create_task(run_agent(run, llm_client))
-    return {"run_id": run.id}
+    run.task_handle = asyncio.create_task(run_agent(run, client))
+    return {"run_id": run.id, "provider": client.provider, "model": client.model}
 
 
 @app.post("/api/confirm/{run_id}")
