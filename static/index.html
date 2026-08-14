@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>AutoBrowse</title>
+<style>
+  :root {
+    --bg: #0e1116;
+    --panel: #161b22;
+    --border: #262d37;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --accent: #6ea8fe;
+    --ok: #3fb950;
+    --err: #f85149;
+    --warn: #e3b341;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+  header {
+    display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap;
+    padding: 18px 24px; border-bottom: 1px solid var(--border);
+  }
+  h1 { margin: 0; font-size: 17px; letter-spacing: .2px; }
+  h1 span { color: var(--accent); }
+  #provider { color: var(--muted); font-size: 12px; font-family: var(--mono); }
+  #provider.bad { color: var(--err); }
+  main { max-width: 940px; margin: 0 auto; padding: 22px 24px 64px; }
+
+  form { display: grid; gap: 10px; grid-template-columns: 1fr 260px auto; }
+  input[type=text] {
+    background: var(--panel); border: 1px solid var(--border); color: var(--text);
+    padding: 11px 13px; border-radius: 8px; font-size: 14px; width: 100%;
+  }
+  input:focus { outline: none; border-color: var(--accent); }
+  button {
+    background: var(--accent); color: #07101f; border: 0; border-radius: 8px;
+    padding: 11px 20px; font-size: 14px; font-weight: 600; cursor: pointer;
+  }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.ghost { background: transparent; color: var(--muted); border: 1px solid var(--border); }
+
+  .examples { margin: 12px 0 0; display: flex; gap: 8px; flex-wrap: wrap; }
+  .examples button {
+    background: transparent; border: 1px solid var(--border); color: var(--muted);
+    font-size: 12px; font-weight: 400; padding: 5px 10px; border-radius: 999px;
+  }
+  .examples button:hover { color: var(--text); border-color: var(--accent); }
+
+  #log { margin-top: 26px; display: flex; flex-direction: column; gap: 10px; }
+  .entry {
+    background: var(--panel); border: 1px solid var(--border);
+    border-left: 3px solid var(--border); border-radius: 8px; padding: 11px 14px;
+  }
+  .entry .head {
+    display: flex; align-items: center; gap: 9px; font-family: var(--mono); font-size: 13px;
+  }
+  .n { color: var(--muted); min-width: 26px; }
+  .act { color: var(--accent); font-weight: 600; }
+  .entry .why { color: var(--muted); margin-top: 5px; font-size: 13px; }
+  .entry .res { font-family: var(--mono); font-size: 12px; color: var(--muted); margin-top: 5px; }
+  .entry.ok { border-left-color: var(--ok); }
+  .entry.err { border-left-color: var(--err); }
+  .entry.err .res { color: var(--err); }
+  .entry.status { border-left-color: var(--muted); color: var(--muted); font-size: 13px; }
+  .entry.thinking { border-left-color: var(--accent); color: var(--muted); font-size: 13px; }
+  .dots::after { content: ""; animation: dots 1.2s steps(4, end) infinite; }
+  @keyframes dots { 0% { content: ""; } 25% { content: "."; } 50% { content: ".."; } 75% { content: "..."; } }
+
+  .entry.confirm { border-left-color: var(--warn); background: #221b0c; }
+  .entry.confirm .title { color: var(--warn); font-weight: 600; }
+  .entry.confirm .row { display: flex; gap: 9px; margin-top: 11px; }
+  .entry.confirm button { padding: 7px 15px; font-size: 13px; }
+  .entry.confirm .deny { background: transparent; border: 1px solid var(--err); color: var(--err); }
+
+  .entry.answer { border-left-color: var(--ok); background: #0f1d13; }
+  .entry.answer .title { color: var(--ok); font-weight: 600; margin-bottom: 7px; }
+  .entry.answer .body { white-space: pre-wrap; }
+  code { font-family: var(--mono); background: #0b0e13; padding: 1px 5px; border-radius: 4px; }
+  @media (max-width: 720px) { form { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Auto<span>Browse</span></h1>
+  <div id="provider">checking model…</div>
+</header>
+
+<main>
+  <form id="form" autocomplete="off">
+    <input id="task" type="text" placeholder="What do you want me to do?" required />
+    <input id="url" type="text" value="https://duckduckgo.com" placeholder="start URL" />
+    <button id="go" type="submit">Run</button>
+  </form>
+
+  <div class="examples">
+    <button type="button" data-task="Search for wireless headphones and list the titles of the first 3 results">search &amp; list top 3</button>
+    <button type="button" data-task="Find today's top technology news headline and tell me what it says">top tech headline</button>
+    <button type="button" data-task="What is the current weather in Tokyo?">weather in Tokyo</button>
+  </div>
+
+  <div id="log"></div>
+</main>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const log = $("#log");
+let runId = null, source = null, thinkingEl = null;
+
+fetch("/api/health").then(r => r.json()).then(h => {
+  const el = $("#provider");
+  el.textContent = h.message + " · max " + h.max_steps + " steps";
+  if (!h.ok) el.classList.add("bad");
+}).catch(() => { $("#provider").textContent = "server unreachable"; });
+
+document.querySelectorAll(".examples button").forEach(b => {
+  b.onclick = () => { $("#task").value = b.dataset.task; $("#task").focus(); };
+});
+
+function add(cls, html) {
+  const el = document.createElement("div");
+  el.className = "entry " + cls;
+  el.innerHTML = html;
+  log.appendChild(el);
+  el.scrollIntoView({ behavior: "smooth", block: "end" });
+  return el;
+}
+
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;" }[c]));
+
+function clearThinking() { if (thinkingEl) { thinkingEl.remove(); thinkingEl = null; } }
+
+$("#form").onsubmit = async (e) => {
+  e.preventDefault();
+  log.innerHTML = "";
+  $("#go").disabled = true;
+  $("#go").textContent = "Running…";
+
+  const body = { task: $("#task").value.trim(), url: $("#url").value.trim() };
+  add("status", "Task: <strong>" + esc(body.task) + "</strong>");
+
+  try {
+    const res = await fetch("/api/run", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(await res.text());
+    runId = (await res.json()).run_id;
+  } catch (err) {
+    add("err", "Failed to start: " + esc(err.message));
+    finish();
+    return;
+  }
+
+  source = new EventSource("/api/events/" + runId);
+  source.onmessage = (ev) => handle(JSON.parse(ev.data));
+  source.onerror = () => { source.close(); finish(); };
+};
+
+function finish() {
+  $("#go").disabled = false;
+  $("#go").textContent = "Run";
+  clearThinking();
+}
+
+function handle(e) {
+  if (e.type !== "thinking") clearThinking();
+
+  if (e.type === "status") {
+    add("status", esc(e.message));
+
+  } else if (e.type === "thinking") {
+    thinkingEl = add("thinking",
+      "<span class='dots'>Step " + e.n + " — reading " + e.elements + " elements on " + esc(e.title || e.url) + "</span>");
+
+  } else if (e.type === "step") {
+    const cls = e.ok ? "ok" : "err";
+    let head = "<div class='head'><span class='n'>" + e.n + ".</span><span class='act'>" +
+      esc(e.action) + "</span>";
+    if (e.target_id !== null && e.target_id !== undefined) head += "<span>[" + e.target_id + "]</span>";
+    if (e.value && e.action !== "done") head += "<span>" + esc(e.value.slice(0, 70)) + "</span>";
+    head += "</div>";
+    let html = head;
+    if (e.reasoning) html += "<div class='why'>" + esc(e.reasoning) + "</div>";
+    html += "<div class='res'>" + esc(e.result) + "</div>";
+    add(cls, html);
+
+  } else if (e.type === "confirm") {
+    const el = add("confirm",
+      "<div class='title'>⚠ Confirmation required — matched “" + esc(e.keyword) + "”</div>" +
+      "<div class='res'>" + esc(e.description) + " " + esc(e.element) + "</div>" +
+      (e.reasoning ? "<div class='why'>" + esc(e.reasoning) + "</div>" : "") +
+      "<div class='row'><button data-ok='1'>Approve</button>" +
+      "<button class='deny' data-ok='0'>Deny &amp; stop</button></div>");
+    el.querySelectorAll("button").forEach(b => {
+      b.onclick = async () => {
+        el.querySelectorAll("button").forEach(x => x.disabled = true);
+        await fetch("/api/confirm/" + runId, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ approved: b.dataset.ok === "1" }),
+        });
+        el.querySelector(".row").innerHTML =
+          "<span class='res'>" + (b.dataset.ok === "1" ? "approved" : "denied") + "</span>";
+      };
+    });
+
+  } else if (e.type === "done") {
+    add("answer", "<div class='title'>✓ Done in " + e.steps + " steps</div>" +
+      "<div class='body'>" + esc(e.answer) + "</div>");
+
+  } else if (e.type === "error") {
+    add("err", "<div class='res'>" + esc(e.message) + "</div>");
+
+  } else if (e.type === "end") {
+    if (source) source.close();
+    finish();
+  }
+}
+</script>
+</body>
+</html>
